@@ -5,7 +5,7 @@ use collection::collection::Collection;
 use collection::collection_state;
 use collection::shards::CollectionId;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::PeerId;
 
 use super::TableOfContent;
@@ -311,10 +311,8 @@ impl TableOfContent {
                 );
                 if let Err(send_error) = proposal_sender.send(operation) {
                     log::error!(
-                        "Can't send proposal to abort transfer of shard {} of collection {}. Error: {}",
+                        "Can't send proposal to abort transfer of shard {} of collection {collection_name}. Error: {send_error}",
                         transfer.shard_id,
-                        collection_name,
-                        send_error
                     );
                 }
             }
@@ -330,10 +328,8 @@ impl TableOfContent {
                     ConsensusOperations::finish_transfer(collection_name.clone(), transfer.clone());
                 if let Err(send_error) = proposal_sender.send(operation) {
                     log::error!(
-                        "Can't send proposal to complete transfer of shard {} of collection {}. Error: {}",
+                        "Can't send proposal to complete transfer of shard {} of collection {collection_name}. Error: {send_error}",
                         transfer.shard_id,
-                        collection_name,
-                        send_error
                     );
                 }
             }

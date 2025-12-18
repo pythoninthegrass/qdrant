@@ -2,8 +2,10 @@ use std::backtrace::Backtrace;
 use std::collections::TryReserveError;
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use atomicwrites::Error as AtomicIoError;
+use gridstore::error::GridstoreError;
 use io::file_operations::FileStorageError;
 use memory::mmap_type::Error as MmapError;
 use rayon::ThreadPoolBuildError;
@@ -48,6 +50,8 @@ pub enum OperationError {
     OutOfMemory { description: String, free: u64 },
     #[error("Operation cancelled: {description}")]
     Cancelled { description: String },
+    #[error("Timeout error: {description}")]
+    Timeout { description: String },
     #[error("Validation failed: {description}")]
     ValidationError { description: String },
     #[error("Wrong usage of sparse vectors")]
@@ -81,36 +85,45 @@ pub enum OperationError {
 impl OperationError {
     /// Create a new service error with a description and a backtrace
     /// Warning: capturing a backtrace can be an expensive operation on some platforms, so this should be used with caution in performance-sensitive parts of code.
-    pub fn service_error(description: impl Into<String>) -> OperationError {
-        OperationError::ServiceError {
+    pub fn service_error(description: impl Into<String>) -> Self {
+        Self::ServiceError {
             description: description.into(),
             backtrace: Some(Backtrace::force_capture().to_string()),
         }
     }
 
     /// Create a new service error with a description and no backtrace
-    pub fn service_error_light(description: impl Into<String>) -> OperationError {
-        OperationError::ServiceError {
+    pub fn service_error_light(description: impl Into<String>) -> Self {
+        Self::ServiceError {
             description: description.into(),
             backtrace: None,
         }
     }
 
-    pub fn validation_error(description: impl Into<String>) -> OperationError {
-        OperationError::ValidationError {
+    pub fn validation_error(description: impl Into<String>) -> Self {
+        Self::ValidationError {
             description: description.into(),
         }
     }
 
-    pub fn inconsistent_storage(description: impl Into<String>) -> OperationError {
-        OperationError::InconsistentStorage {
+    pub fn inconsistent_storage(description: impl Into<String>) -> Self {
+        Self::InconsistentStorage {
             description: description.into(),
         }
     }
 
-    pub fn vector_name_not_exists(vector_name: impl Into<String>) -> OperationError {
-        OperationError::VectorNameNotExists {
+    pub fn vector_name_not_exists(vector_name: impl Into<String>) -> Self {
+        Self::VectorNameNotExists {
             received_name: vector_name.into(),
+        }
+    }
+
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
+        Self::Timeout {
+            description: format!(
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
+            ),
         }
     }
 }
@@ -219,6 +232,23 @@ impl From<TryReserveError> for OperationError {
     }
 }
 
+impl From<GridstoreError> for OperationError {
+    fn from(err: GridstoreError) -> Self {
+        match err {
+            GridstoreError::ServiceError { description } => {
+                Self::service_error(format!("Gridstore error: {description}"))
+            }
+            GridstoreError::FlushCancelled => Self::Cancelled {
+                description: "Gridstore flushing was cancelled".to_string(),
+            },
+            GridstoreError::Io(_) | GridstoreError::Mmap(_) | GridstoreError::SerdeJson(_) => {
+                Self::service_error(err.to_string())
+            }
+            GridstoreError::ValidationError { message } => Self::validation_error(message),
+        }
+    }
+}
+
 #[cfg(feature = "gpu")]
 impl From<gpu::GpuError> for OperationError {
     fn from(err: gpu::GpuError) -> Self {
@@ -256,4 +286,50 @@ pub fn check_process_stopped(stopped: &AtomicBool) -> CancellableResult<()> {
         return Err(CancelledError);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_timeout_error_formatting() {
+        // Test sub-second timeout (500ms)
+        let timeout = Duration::from_millis(500);
+        let error = OperationError::timeout(timeout, "test operation");
+        let error_msg = format!("{error}");
+        assert!(
+            error_msg.contains("500ms"),
+            "Expected '500ms' but got: {error_msg}"
+        );
+
+        // Test exact second timeout (1000ms = 1s)
+        let timeout = Duration::from_millis(1000);
+        let error = OperationError::timeout(timeout, "test operation");
+        let error_msg = format!("{error}");
+        assert!(
+            error_msg.contains("1s"),
+            "Expected '1s' but got: {error_msg}"
+        );
+
+        // Test multi-second timeout with sub-second precision (2500ms = 2.5s)
+        let timeout = Duration::from_millis(2500);
+        let error = OperationError::timeout(timeout, "test operation");
+        let error_msg = format!("{error}");
+        assert!(
+            error_msg.contains("2.5s"),
+            "Expected '2.5s' but got: {error_msg}"
+        );
+
+        // Test large timeout (60000ms = 60s)
+        let timeout = Duration::from_millis(60000);
+        let error = OperationError::timeout(timeout, "test operation");
+        let error_msg = format!("{error}");
+        assert!(
+            error_msg.contains("60s"),
+            "Expected '60s' but got: {error_msg}"
+        );
+    }
 }

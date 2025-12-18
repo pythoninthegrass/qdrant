@@ -1,5 +1,6 @@
 pub mod config;
 pub mod query;
+pub mod repr;
 pub mod search;
 pub mod types;
 pub mod update;
@@ -46,8 +47,8 @@ mod qdrant_edge {
     };
     #[pymodule_export]
     use super::search::{
-        PyAcornSearchParams, PyQuantizationSearchParams, PyScoredPoint, PySearchParams,
-        PySearchRequest,
+        PyAcornSearchParams, PyPayloadSelectorInterface, PyQuantizationSearchParams,
+        PySearchParams, PySearchRequest,
     };
     #[pymodule_export]
     use super::types::filter::{
@@ -60,11 +61,11 @@ mod qdrant_edge {
     use super::types::formula::{PyDecayKind, PyExpressionInterface, PyFormula};
     #[pymodule_export]
     use super::types::query::{
-        PyContextPair, PyContextQuery, PyDiscoverQuery, PyFeedbackItem, PyFeedbackSimpleQuery,
-        PyQueryInterface, PyRecommendQuery, PySimpleFeedbackStrategy,
+        PyContextPair, PyContextQuery, PyDiscoverQuery, PyFeedbackItem, PyFeedbackNaiveQuery,
+        PyNaiveFeedbackCoefficients, PyQueryInterface, PyRecommendQuery,
     };
     #[pymodule_export]
-    use super::types::{PyPoint, PyPointVectors, PyRecord, PySparseVector};
+    use super::types::{PyPoint, PyPointVectors, PyRecord, PyScoredPoint, PySparseVector};
     #[pymodule_export]
     use super::update::PyUpdateOperation;
 }

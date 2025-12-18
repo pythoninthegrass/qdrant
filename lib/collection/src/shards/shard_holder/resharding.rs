@@ -13,7 +13,8 @@ use crate::operations::CollectionUpdateOperations;
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::point_ops::{ConditionalInsertOperationInternal, PointOperations};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
+use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::resharding::{ReshardKey, ReshardStage, ReshardState};
 use crate::shards::shard::ShardId;
 
@@ -320,7 +321,7 @@ impl ShardHolder {
                 // Revert replicas in `Resharding` state back into `Active` state
                 for (peer, state) in shard.peers() {
                     if state.is_resharding() {
-                        shard.set_replica_state(peer, ReplicaState::Active)?;
+                        shard.set_replica_state(peer, ReplicaState::Active).await?;
                     }
                 }
 
@@ -579,6 +580,12 @@ impl OperationsByMode {
                 PointOperations::SyncPoints(op) => {
                     vec![CollectionUpdateOperations::PointOperation(
                         PointOperations::SyncPoints(op),
+                    )]
+                }
+                #[cfg(feature = "staging")]
+                PointOperations::TestDelay(op) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::TestDelay(op),
                     )]
                 }
             },

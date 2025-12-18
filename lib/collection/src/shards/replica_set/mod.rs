@@ -3,6 +3,7 @@ mod execute_read_operation;
 mod locally_disabled_peers;
 mod partial_snapshot_meta;
 mod read_ops;
+pub mod replica_set_state;
 mod shard_transfer;
 pub mod snapshots;
 mod telemetry;
@@ -18,8 +19,8 @@ use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::rate_limiting::RateLimiter;
 use common::save_on_disk::SaveOnDisk;
-use schemars::JsonSchema;
-use segment::common::anonymize::Anonymize;
+use parking_lot::Mutex as ParkingMutex;
+use replica_set_state::{ReplicaSetState, ReplicaState};
 use segment::types::{ExtendedPointId, Filter, ShardKey};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -33,6 +34,7 @@ use super::local_shard::clock_map::RecoveryPoint;
 use super::remote_shard::RemoteShard;
 use super::transfer::ShardTransfer;
 use crate::collection::payload_index_schema::PayloadIndexSchema;
+use crate::collection_manager::optimizers::TrackerLog;
 use crate::common::collection_size_stats::CollectionSizeStats;
 use crate::common::snapshots_manager::SnapshotStorageManager;
 use crate::config::CollectionConfigInternal;
@@ -433,7 +435,7 @@ impl ShardReplicaSet {
     }
 
     pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
-        self.replica_state.read().peers()
+        self.replica_state.read().peers().clone()
     }
 
     /// Checks if the current replica contains a unique source of truth and should never
@@ -589,7 +591,7 @@ impl ShardReplicaSet {
                 Ok(())
             } else {
                 Err(CollectionError::timeout(
-                    timeout.as_secs() as usize,
+                    timeout,
                     "wait for replica set state",
                 ))
             }
@@ -652,6 +654,9 @@ impl ShardReplicaSet {
                     rs.set_peer_state(self.this_peer_id(), state);
                 }
             })?;
+
+            self.on_local_state_updated(state.unwrap_or(ReplicaState::Dead))
+                .await?;
         }
         self.update_locally_disabled(self.this_peer_id());
         Ok(old_shard)
@@ -682,11 +687,14 @@ impl ShardReplicaSet {
     }
 
     pub async fn add_remote(&self, peer_id: PeerId, state: ReplicaState) -> CollectionResult<()> {
-        debug_assert!(peer_id != self.this_peer_id());
+        debug_assert_ne!(peer_id, self.this_peer_id());
 
-        self.replica_state.write(|rs| {
-            rs.set_peer_state(peer_id, state);
-        })?;
+        self.replica_state
+            .write(|rs| rs.set_peer_state(peer_id, state))?;
+
+        if self.this_peer_id() == peer_id {
+            self.on_local_state_updated(state).await?;
+        }
 
         self.update_locally_disabled(peer_id);
 
@@ -727,7 +735,7 @@ impl ShardReplicaSet {
         state: ReplicaState,
     ) -> CollectionResult<()> {
         if peer_id == self.this_peer_id() {
-            self.set_replica_state(peer_id, state)?;
+            self.set_replica_state(peer_id, state).await?;
         } else {
             // Create remote shard if necessary
             self.add_remote(peer_id, state).await?;
@@ -735,7 +743,11 @@ impl ShardReplicaSet {
         Ok(())
     }
 
-    pub fn set_replica_state(&self, peer_id: PeerId, state: ReplicaState) -> CollectionResult<()> {
+    pub async fn set_replica_state(
+        &self,
+        peer_id: PeerId,
+        state: ReplicaState,
+    ) -> CollectionResult<()> {
         log::debug!(
             "Changing local shard {}:{} state from {:?} to {state:?}",
             self.collection_id,
@@ -749,7 +761,30 @@ impl ShardReplicaSet {
             }
             rs.set_peer_state(peer_id, state);
         })?;
+
+        if self.this_peer_id() == peer_id {
+            self.on_local_state_updated(state).await?;
+        }
+
         self.update_locally_disabled(peer_id);
+        Ok(())
+    }
+
+    /// Called when the local replica state is updated
+    ///
+    /// Not called if:
+    /// - there is no local shard
+    /// - the local shard is removed
+    async fn on_local_state_updated(&self, new_state: ReplicaState) -> CollectionResult<()> {
+        // Update newest clocks snapshot on each state change
+        if let Some(local_shard) = self.local.read().await.as_ref() {
+            if new_state.is_active() {
+                local_shard.clear_newest_clocks_snapshot().await?;
+            } else {
+                local_shard.take_newest_clocks_snapshot().await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -767,11 +802,15 @@ impl ShardReplicaSet {
         replicas: HashMap<PeerId, ReplicaState>,
         shard_key: Option<ShardKey>,
     ) -> CollectionResult<()> {
-        let old_peers = self.replica_state.read().peers();
+        let old_peers = self.replica_state.read().peers().clone();
 
         self.replica_state.write(|state| {
             state.set_peers(replicas.clone());
         })?;
+
+        if let Some(&state) = replicas.get(&self.this_peer_id()) {
+            self.on_local_state_updated(state).await?;
+        }
 
         self.locally_disabled_peers.write().clear();
 
@@ -1078,6 +1117,18 @@ impl ShardReplicaSet {
         is_readable && !self.is_locally_disabled(peer_id)
     }
 
+    /// Check if this shard is active.
+    /// By active, we mean, that at least one replica have `is_active` state.
+    /// It is possible, that some replicas are not active, if they are created in a `Partial` state.
+    /// For example, during tenant promotion.
+    pub fn shard_is_active(&self) -> bool {
+        let replica_state = self.replica_state.read();
+        replica_state
+            .peers()
+            .values()
+            .any(|state| state.is_active())
+    }
+
     /// Check if this peer can be used as a source of truth within a shard_id.
     /// For instance:
     /// - It can be the only receiver of updates
@@ -1253,227 +1304,10 @@ impl ShardReplicaSet {
     pub(crate) fn payload_index_schema(&self) -> Arc<SaveOnDisk<PayloadIndexSchema>> {
         self.payload_index_schema.clone()
     }
-}
 
-/// Represents a replica set state
-#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone)]
-pub struct ReplicaSetState {
-    pub is_local: bool,
-    pub this_peer_id: PeerId,
-    peers: HashMap<PeerId, ReplicaState>,
-}
-
-impl ReplicaSetState {
-    pub fn get_peer_state(&self, peer_id: PeerId) -> Option<ReplicaState> {
-        self.peers.get(&peer_id).copied()
-    }
-
-    pub fn set_peer_state(&mut self, peer_id: PeerId, state: ReplicaState) {
-        self.peers.insert(peer_id, state);
-    }
-
-    pub fn remove_peer_state(&mut self, peer_id: PeerId) -> Option<ReplicaState> {
-        self.peers.remove(&peer_id)
-    }
-
-    pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
-        self.peers.clone()
-    }
-
-    pub fn check_peers_state_all<F>(&self, check: F) -> bool
-    where
-        F: Fn(ReplicaState) -> bool,
-    {
-        self.peers.values().all(|state| check(*state))
-    }
-
-    pub fn active_peers(&self) -> Vec<PeerId> {
-        self.peers
-            .iter()
-            .filter_map(|(peer_id, state)| {
-                // We consider `ReshardingScaleDown` to be `Active`!
-                state.is_active().then_some(*peer_id)
-            })
-            .collect()
-    }
-
-    pub fn readable_peers(&self) -> Vec<PeerId> {
-        self.peers
-            .iter()
-            .filter_map(|(peer_id, state)| state.is_readable().then_some(*peer_id))
-            .collect()
-    }
-
-    pub fn active_or_resharding_peers(&self) -> impl Iterator<Item = PeerId> + '_ {
-        self.peers.iter().filter_map(|(peer_id, state)| {
-            matches!(
-                state,
-                ReplicaState::Active | ReplicaState::Resharding | ReplicaState::ReshardingScaleDown
-            )
-            .then_some(*peer_id)
-        })
-    }
-
-    pub fn set_peers(&mut self, peers: HashMap<PeerId, ReplicaState>) {
-        self.peers = peers;
-    }
-}
-
-/// State of the single shard within a replica set.
-#[derive(
-    Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy, Anonymize,
-)]
-pub enum ReplicaState {
-    // Active and sound
-    #[default]
-    Active,
-    // Failed for some reason
-    Dead,
-    // The shard is partially loaded and is currently receiving data from other shards
-    Partial,
-    // Collection is being created
-    Initializing,
-    // A shard which receives data, but is not used for search
-    // Useful for backup shards
-    Listener,
-    // Deprecated since Qdrant 1.9.0, used in Qdrant 1.7.0 and 1.8.0
-    //
-    // Snapshot shard transfer is in progress, updates aren't sent to the shard
-    // Normally rejects updates. Since 1.8 it allows updates if force is true.
-    PartialSnapshot,
-    // Shard is undergoing recovery by an external node
-    // Normally rejects updates, accepts updates if force is true
-    Recovery,
-    // Points are being migrated to this shard as part of resharding up
-    Resharding,
-    // Points are being migrated to this shard as part of resharding down
-    ReshardingScaleDown,
-    // Active for readers, Partial for writers
-    ActiveRead,
-}
-
-impl ReplicaState {
-    /// Check if replica state is active
-    /// Used to define if this replica can be used as a source of truth.
-    pub fn is_active(self) -> bool {
-        match self {
-            ReplicaState::Active => true,
-            ReplicaState::ReshardingScaleDown => true,
-
-            ReplicaState::Dead
-            | ReplicaState::Partial
-            | ReplicaState::Initializing
-            | ReplicaState::Listener
-            | ReplicaState::PartialSnapshot
-            | ReplicaState::Recovery
-            | ReplicaState::Resharding
-            | ReplicaState::ActiveRead => false,
-        }
-    }
-
-    /// Check that replica has full dataset, so it can be used for read operations.
-    pub fn is_readable(self) -> bool {
-        match self {
-            ReplicaState::Active => true,
-            ReplicaState::ReshardingScaleDown => true,
-            ReplicaState::ActiveRead => true,
-            // False from here on
-            ReplicaState::Dead => false,
-            ReplicaState::Partial => false,
-            ReplicaState::Initializing => false,
-            ReplicaState::Listener => false,
-            ReplicaState::PartialSnapshot => false,
-            ReplicaState::Recovery => false,
-            ReplicaState::Resharding => false,
-        }
-    }
-
-    pub fn is_updatable(self) -> bool {
-        match self {
-            ReplicaState::Active => true,
-            ReplicaState::Partial => true,
-            ReplicaState::Initializing => true,
-            ReplicaState::Listener => true,
-            ReplicaState::Recovery | ReplicaState::PartialSnapshot => false,
-            ReplicaState::Resharding | ReplicaState::ReshardingScaleDown => true,
-            ReplicaState::Dead => false,
-            ReplicaState::ActiveRead => true,
-        }
-    }
-
-    /// Check if this peer can be used as a source of truth within a shard_id.
-    /// For instance:
-    /// - It can be the only receiver of updates
-    /// - It can be a primary replica for ordered writes
-    pub fn can_be_source_of_truth(self) -> bool {
-        match self {
-            ReplicaState::Active => true,
-            ReplicaState::ActiveRead => true, // Can be only one replica per shard_id
-            ReplicaState::Resharding => true, // Can be only one replica per shard_id
-            ReplicaState::ReshardingScaleDown => true, // Acts like Active, until resharding is committed
-            // false from here on
-            ReplicaState::Partial => false,
-            ReplicaState::Initializing => false,
-            ReplicaState::Listener => false,
-            ReplicaState::PartialSnapshot => false,
-            ReplicaState::Recovery => false,
-            ReplicaState::Dead => false,
-        }
-    }
-
-    /// Check whether the replica state is active or listener or resharding.
-    /// Healthy state means that replica does not require **automatic** recovery.
-    pub fn is_healthy(self) -> bool {
-        match self {
-            ReplicaState::Active
-            | ReplicaState::Listener
-            | ReplicaState::Resharding
-            | ReplicaState::ReshardingScaleDown => true,
-
-            ReplicaState::Dead
-            | ReplicaState::Initializing
-            | ReplicaState::Partial
-            | ReplicaState::PartialSnapshot
-            | ReplicaState::Recovery
-            | ReplicaState::ActiveRead => false,
-        }
-    }
-
-    /// Check whether the replica state is partial or partial-like.
-    ///
-    /// In other words: is the state related to shard transfers?
-    //
-    // TODO(resharding): What's the best way to handle `ReshardingScaleDown` properly!?
-    pub fn is_partial_or_recovery(self) -> bool {
-        match self {
-            ReplicaState::Partial
-            | ReplicaState::PartialSnapshot
-            | ReplicaState::Recovery
-            | ReplicaState::Resharding
-            | ReplicaState::ReshardingScaleDown
-            | ReplicaState::ActiveRead => true,
-
-            ReplicaState::Active
-            | ReplicaState::Dead
-            | ReplicaState::Initializing
-            | ReplicaState::Listener => false,
-        }
-    }
-
-    /// Returns `true` if the replica state is resharding, either up or down.
-    pub fn is_resharding(&self) -> bool {
-        match self {
-            ReplicaState::Resharding | ReplicaState::ReshardingScaleDown => true,
-
-            ReplicaState::Partial
-            | ReplicaState::PartialSnapshot
-            | ReplicaState::Recovery
-            | ReplicaState::Active
-            | ReplicaState::Dead
-            | ReplicaState::Initializing
-            | ReplicaState::Listener
-            | ReplicaState::ActiveRead => false,
-        }
+    pub async fn optimizers_log(&self) -> Option<Arc<ParkingMutex<TrackerLog>>> {
+        let local = self.local.read().await;
+        local.as_ref().and_then(|shard| shard.optimizers_log())
     }
 }
 

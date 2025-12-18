@@ -221,6 +221,7 @@ mod tests {
 
     use common::budget::ResourceBudget;
     use common::counter::hardware_counter::HardwareCounterCell;
+    use common::progress_tracker::ProgressTracker;
     use itertools::Itertools;
     use parking_lot::RwLock;
     use segment::entry::entry_point::SegmentEntry;
@@ -354,6 +355,8 @@ mod tests {
                 permit,
                 budget.clone(),
                 &AtomicBool::new(false),
+                ProgressTracker::new_for_test(),
+                Box::new(|| ()),
             )
             .unwrap();
 
@@ -506,6 +509,8 @@ mod tests {
                 permit,
                 budget.clone(),
                 &false.into(),
+                ProgressTracker::new_for_test(),
+                Box::new(|| ()),
             )
             .unwrap();
         assert!(changed > 0, "optimizer should have rebuilt this segment");
@@ -622,6 +627,8 @@ mod tests {
                 permit,
                 budget.clone(),
                 &false.into(),
+                ProgressTracker::new_for_test(),
+                Box::new(|| ()),
             )
             .unwrap();
         assert!(changed > 0, "optimizer should have rebuilt this segment");

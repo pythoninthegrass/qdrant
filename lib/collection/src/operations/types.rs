@@ -12,6 +12,7 @@ use api::rest::{
     SearchGroupsRequestInternal, SearchRequestInternal, ShardKeySelector, VectorStructOutput,
 };
 use common::ext::OptionExt;
+use common::progress_tracker::ProgressTree;
 use common::rate_limiting::{RateLimitError, RetryError};
 use common::types::ScoreType;
 use common::validation::validate_range_generic;
@@ -51,7 +52,7 @@ use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::config_diff::{HnswConfigDiff, QuantizationConfigDiff};
 use crate::optimizers_builder::OptimizersConfig;
-use crate::shards::replica_set::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::transfer::ShardTransferMethod;
 
@@ -280,6 +281,18 @@ pub struct CollectionClusterInfo {
     // TODO(resharding): remove this skip when releasing resharding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resharding_operations: Option<Vec<ReshardingInfo>>,
+}
+
+/// Optimizations progress for the collection
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OptimizationsResponse {
+    /// Ongoing optimizations from newest to oldest.
+    pub ongoing: Vec<ProgressTree>,
+    /// Completed optimizations from newest to oldest.
+    // NOTE: `None` when `?completed=false`,
+    //        empty vec when `?completed=true` but no completed optimizations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<Vec<ProgressTree>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
@@ -932,11 +945,11 @@ pub enum CollectionError {
 }
 
 impl CollectionError {
-    pub fn timeout(timeout_sec: usize, operation: impl Into<String>) -> Self {
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
         Self::Timeout {
             description: format!(
-                "Operation '{}' timed out after {timeout_sec} seconds",
-                operation.into()
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
             ),
         }
     }
@@ -1136,6 +1149,7 @@ impl From<OperationError> for CollectionError {
             OperationError::OutOfMemory { description, free } => {
                 Self::OutOfMemory { description, free }
             }
+            OperationError::Timeout { description } => Self::Timeout { description },
             OperationError::InconsistentStorage { .. } => Self::ServiceError {
                 error: format!("{err}"),
                 backtrace: None,

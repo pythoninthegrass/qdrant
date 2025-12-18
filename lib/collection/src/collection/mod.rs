@@ -29,6 +29,7 @@ use semver::Version;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 
+use crate::collection::collection_ops::ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION;
 use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_state::{ShardInfo, State};
 use crate::common::collection_size_stats::{
@@ -43,10 +44,11 @@ use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
 use crate::shards::local_shard::clock_map::RecoveryPoint;
-use crate::shards::replica_set::ReplicaState::{Active, Dead, Initializing, Listener};
-use crate::shards::replica_set::{
-    ChangePeerFromState, ChangePeerState, ReplicaState, ShardReplicaSet,
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState::{
+    Active, Dead, Initializing, Listener,
 };
+use crate::shards::replica_set::{ChangePeerFromState, ChangePeerState, ShardReplicaSet};
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
 use crate::shards::shard_holder::{LockedShardHolder, ShardHolder, shard_not_found_error};
@@ -452,7 +454,20 @@ impl Collection {
 
         if new_state == ReplicaState::Dead {
             let resharding_state = shard_holder.resharding_state.read().clone();
-            let related_transfers = shard_holder.get_related_transfers(shard_id, peer_id);
+
+            let all_nodes_fixed_cancellation = self
+                .channel_service
+                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION);
+            let related_transfers = if all_nodes_fixed_cancellation {
+                shard_holder.get_related_transfers(peer_id, shard_id)
+            } else {
+                // This is the old buggy logic, but we have to keep it
+                // for maintaining consistency in a cluster with mixed versions.
+                shard_holder.get_transfers(|transfer| {
+                    transfer.shard_id == shard_id
+                        && (transfer.from == peer_id || transfer.to == peer_id)
+                })
+            };
 
             // Functions below lock `shard_holder`!
             drop(shard_holder);
@@ -610,8 +625,7 @@ impl Collection {
         let shard_holder = self.shards_holder.read().await;
 
         let get_shard_transfers = |shard_id, from| {
-            shard_holder
-                .get_transfers(|transfer| transfer.shard_id == shard_id && transfer.from == from)
+            shard_holder.get_transfers(|transfer| transfer.is_source(from, shard_id))
         };
 
         for replica_set in shard_holder.all_shards() {
@@ -810,8 +824,10 @@ impl Collection {
             };
 
             shard_optimization_statuses.push(shard_optimization_status);
-
-            vectors += shard.get_size_stats().await.num_vectors;
+            let size_stats = shard
+                .get_size_stats(timeout.saturating_sub(start.elapsed()))
+                .await?;
+            vectors += size_stats.num_vectors;
         }
 
         let optimizers_status = shard_optimization_statuses

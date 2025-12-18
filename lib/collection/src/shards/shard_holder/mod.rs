@@ -47,7 +47,8 @@ use crate::operations::types::{
 use crate::operations::{OperationToShard, SplitByShard};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
-use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
+use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_config::ShardConfig;
 use crate::shards::transfer::{ShardTransfer, ShardTransferKey};
@@ -558,10 +559,9 @@ impl ShardHolder {
         Some(resharding_operations)
     }
 
-    pub fn get_related_transfers(&self, shard_id: ShardId, peer_id: PeerId) -> Vec<ShardTransfer> {
-        self.get_transfers(|transfer| {
-            transfer.shard_id == shard_id && (transfer.from == peer_id || transfer.to == peer_id)
-        })
+    /// Get all transfers related to the given peer and shard ID pair
+    pub fn get_related_transfers(&self, peer_id: PeerId, shard_id: ShardId) -> Vec<ShardTransfer> {
+        self.get_transfers(|transfer| transfer.is_source_or_target(peer_id, shard_id))
     }
 
     pub fn get_shard_ids_by_key(&self, shard_key: &ShardKey) -> CollectionResult<HashSet<ShardId>> {
@@ -584,6 +584,11 @@ impl ShardHolder {
                 debug_assert!(false, "Do not expect empty shard selector")
             }
             ShardSelectorInternal::All => {
+                let is_custom_sharding = match self.sharding_method {
+                    ShardingMethod::Auto => false,
+                    ShardingMethod::Custom => true,
+                };
+
                 for (&shard_id, shard) in self.shards.iter() {
                     // Ignore a new resharding shard until it completed point migration
                     // The shard will be marked as active at the end of the migration stage
@@ -594,6 +599,15 @@ impl ShardHolder {
                                 && state.stage < ReshardStage::ReadHashRingCommitted
                         });
                     if resharding_migrating_up {
+                        continue;
+                    }
+
+                    // Technically, we could skip inactive shards regardless of sharding method,
+                    // as we do not expect that shard id can even become inactive on all replicas.
+                    // (if it happens, means there is a bug)
+                    // But for earlier detection of such issues, we only do this check for custom sharding,
+                    // where this situation is expected for the case of tenant promotion.
+                    if is_custom_sharding && !shard.shard_is_active() {
                         continue;
                     }
 
@@ -900,6 +914,7 @@ impl ShardHolder {
                 );
                 replica_set
                     .set_replica_state(local_peer_id, ReplicaState::Active)
+                    .await
                     .expect("Failed to set local shard state");
             }
             let shard_key = shard_id_to_key_mapping.get(&shard_id).cloned();

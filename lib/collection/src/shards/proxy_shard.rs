@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
 use common::types::TelemetryDetail;
+use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::manifest::SnapshotManifest;
 use segment::index::field_index::CardinalityEstimation;
@@ -22,6 +23,7 @@ use tokio::sync::{RwLock, oneshot};
 use tokio::time::timeout;
 
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
 use crate::operations::OperationWithClockTag;
 use crate::operations::operation_effect::{
     EstimateOperationEffectArea, OperationEffectArea, PointsOperationEffect,
@@ -45,7 +47,7 @@ type ChangedPointsSet = Arc<RwLock<AHashSet<PointIdType>>>;
 /// It can be used to provide all read and write operations while the wrapped shard is being transferred to another node.
 /// It keeps track of changed points during the shard transfer to assure consistency.
 pub struct ProxyShard {
-    wrapped_shard: LocalShard,
+    pub(super) wrapped_shard: LocalShard,
     changed_points: ChangedPointsSet,
     pub changed_alot: AtomicBool,
 }
@@ -120,8 +122,7 @@ impl ProxyShard {
             // So we will timeout and try again
             if timeout(attempt_timeout, rx).await.is_err() {
                 log::warn!(
-                    "Timeout {} while waiting for the wrapped shard to finish the update queue, retrying",
-                    attempt_timeout.as_secs(),
+                    "Timeout {attempt_timeout:?} while waiting for the wrapped shard to finish the update queue, retrying",
                 );
                 attempt += 1;
                 if attempt_timeout > UPDATE_QUEUE_CLEAR_MAX_TIMEOUT {
@@ -159,12 +160,16 @@ impl ProxyShard {
         self.wrapped_shard.get_optimization_status(timeout).await
     }
 
-    pub async fn get_size_stats(&self) -> SizeStats {
-        self.wrapped_shard.get_size_stats().await
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
+        self.wrapped_shard.get_size_stats(timeout).await
     }
 
     pub fn update_tracker(&self) -> &UpdateTracker {
         self.wrapped_shard.update_tracker()
+    }
+
+    pub fn optimizers_log(&self) -> Arc<ParkingMutex<TrackerLog>> {
+        self.wrapped_shard.optimizers_log()
     }
 
     pub async fn estimate_cardinality(

@@ -8,6 +8,7 @@ import grpc_requests
 import pytest
 import requests
 from consensus_tests import fixtures
+from consensus_tests.utils import PROJECT_ROOT
 from grpc_interceptor import ClientCallDetails, ClientInterceptor
 
 from .utils import (
@@ -19,7 +20,7 @@ from .utils import (
     REST_URI,
     SECRET,
     encode_jwt,
-    random_str, decode_jwt,
+    random_str,
 )
 
 COLL_NAME = "jwt_test_collection"
@@ -137,6 +138,12 @@ ACTION_ACCESS = {
         True,
         "GET /collections/{collection_name}/exists",
         "qdrant.Collections/CollectionExists",
+    ),
+    "get_optimizations": EndpointAccess(
+        True,
+        True,
+        True,
+        "GET /collections/{collection_name}/optimizations",
     ),
     "replicate_shard_operation": EndpointAccess(
         False,
@@ -590,8 +597,8 @@ def test_all_actions_have_tests():
 
 def test_all_rest_endpoints_are_covered():
     # Load the JSON content from the openapi.json file
-    with open("./docs/redoc/master/openapi.json", "r") as file:
-        openapi_data = json.load(file)
+    openapi_path = PROJECT_ROOT / "docs" / "redoc" / "master" / "openapi.json"
+    openapi_data = json.loads(openapi_path.read_text())
 
     # Extract all endpoint paths
     endpoint_paths = []
@@ -975,6 +982,13 @@ def test_collection_exists():
         "collection_exists",
         path_params={"collection_name": COLL_NAME},
         grpc_request={"collection_name": COLL_NAME},
+    )
+
+
+def test_get_optimizations():
+    check_access(
+        "get_optimizations",
+        path_params={"collection_name": COLL_NAME},
     )
 
 

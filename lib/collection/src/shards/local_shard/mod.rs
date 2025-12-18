@@ -96,6 +96,7 @@ const OLDEST_CLOCKS_PATH: &str = "oldest_clocks.json";
 /// LocalShard is an entity that can be moved between peers and contains some part of one collections data.
 ///
 /// Holds all object, required for collection functioning
+#[must_use = "Local Shard must be explicitly handled"]
 pub struct LocalShard {
     collection_name: CollectionId,
     pub(super) segments: LockedSegmentHolder,
@@ -958,11 +959,51 @@ impl LocalShard {
         &self.update_tracker
     }
 
+    pub fn optimizers_log(&self) -> Arc<ParkingMutex<TrackerLog>> {
+        Arc::clone(&self.optimizers_log)
+    }
+
     /// Get the recovery point for the current shard
     ///
     /// This is sourced from the last seen clocks from other nodes that we know about.
     pub async fn recovery_point(&self) -> RecoveryPoint {
         self.wal.recovery_point().await
+    }
+
+    /// Take snapshot of newest clocks, if not snapshotted already
+    ///
+    /// Also immediately persists clocks to disk.
+    pub async fn take_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        let changed = self.wal.take_newest_clocks_snapshot().await;
+
+        // When taking clocks snapshot, persist changes immediately
+        if changed {
+            self.update_handler
+                .lock()
+                .await
+                .store_clocks_if_changed()
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Clear any snapshot of newest clocks
+    ///
+    /// Also immediately persists clocks to disk.
+    pub async fn clear_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        let changed = self.wal.clear_newest_clocks_snapshot().await;
+
+        // When clearing clocks snapshot, persist changes immediately
+        if changed {
+            self.update_handler
+                .lock()
+                .await
+                .store_clocks_if_changed()
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Update the cutoff point on the current shard
@@ -1002,6 +1043,11 @@ impl LocalShard {
                 })?;
         }
         Ok(())
+    }
+
+    // Returns configured default search timeout if timeout is None
+    fn timeout_or_default_search_timeout(&self, timeout: Option<Duration>) -> Duration {
+        timeout.unwrap_or(self.shared_storage_config.search_timeout)
     }
 }
 

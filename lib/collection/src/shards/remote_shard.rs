@@ -47,7 +47,6 @@ use super::conversions::{
     internal_update_vectors,
 };
 use super::local_shard::clock_map::RecoveryPoint;
-use super::replica_set::ReplicaState;
 use crate::operations::conversions::try_record_from_grpc;
 use crate::operations::payload_ops::PayloadOps;
 use crate::operations::point_ops::{PointOperations, WriteOrdering};
@@ -67,6 +66,7 @@ use crate::shards::conversions::{
     internal_delete_points_by_filter, internal_set_payload, internal_sync_points,
     internal_upsert_points, try_scored_point_from_grpc,
 };
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_trait::ShardOperation;
 use crate::shards::telemetry::RemoteShardTelemetry;
@@ -300,6 +300,11 @@ impl RemoteShard {
                             ordering,
                         )?;
                         Update::Sync(request)
+                    }
+                    #[cfg(feature = "staging")]
+                    PointOperations::TestDelay(_) => {
+                        // Staging test delay operations should not be forwarded to remote shards
+                        continue;
                     }
                 },
                 CollectionUpdateOperations::VectorOperation(vector_ops) => match vector_ops {
@@ -570,6 +575,22 @@ impl RemoteShard {
                     })
                     .await?
                     .into_inner()
+                }
+                #[cfg(feature = "staging")]
+                PointOperations::TestDelay(op) => {
+                    // TODO: Add gRPC support to forward staging operations to remote shards
+                    // For now, staging test delay operations only execute on local shards
+                    let delay = std::time::Duration::from_secs_f64(op.duration.into_inner());
+                    log::debug!(
+                        "TestDelay: skipping remote shard {} (duration: {delay:?})",
+                        self.id
+                    );
+                    timer.set_success(true);
+                    return Ok(UpdateResult {
+                        operation_id: None,
+                        status: crate::operations::types::UpdateStatus::Completed,
+                        clock_tag: operation.clock_tag,
+                    });
                 }
             },
             CollectionUpdateOperations::VectorOperation(vector_ops) => match vector_ops {
@@ -904,7 +925,7 @@ impl RemoteShard {
     ) -> CollectionResult<Option<Duration>> {
         match timeout {
             None => Ok(timeout),
-            Some(t) if t.is_zero() => Err(CollectionError::timeout(0, operation)),
+            Some(t) if t.is_zero() => Err(CollectionError::timeout(Duration::ZERO, operation)),
             Some(t) => {
                 // round up to avoid losing completely timeouts that are under 1 second
                 let timeout_secs = t.as_secs_f32().ceil() as u64;

@@ -1,13 +1,26 @@
+use std::fmt;
+
 use derive_more::Into;
 use ordered_float::OrderedFloat;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use segment::types::*;
 
+use crate::repr::*;
+
 #[derive(Copy, Clone, Debug, FromPyObject, IntoPyObject)]
 pub enum PyRange {
     Float(PyRangeFloat),
     DateTime(PyRangeDateTime),
+}
+
+impl Repr for PyRange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PyRange::Float(float) => float.fmt(f),
+            PyRange::DateTime(date_time) => date_time.fmt(f),
+        }
+    }
 }
 
 impl From<RangeInterface> for PyRange {
@@ -32,6 +45,7 @@ impl From<PyRange> for RangeInterface {
 #[derive(Copy, Clone, Debug, Into)]
 pub struct PyRangeFloat(pub Range<OrderedFloat<FloatPayloadType>>);
 
+#[pyclass_repr]
 #[pymethods]
 impl PyRangeFloat {
     #[new]
@@ -49,12 +63,45 @@ impl PyRangeFloat {
             lt: lt.map(OrderedFloat),
         })
     }
+
+    #[getter]
+    pub fn gte(&self) -> Option<FloatPayloadType> {
+        self.0.gte.map(|of| of.into_inner())
+    }
+
+    #[getter]
+    pub fn gt(&self) -> Option<FloatPayloadType> {
+        self.0.gt.map(|of| of.into_inner())
+    }
+
+    #[getter]
+    pub fn lte(&self) -> Option<FloatPayloadType> {
+        self.0.lte.map(|of| of.into_inner())
+    }
+
+    #[getter]
+    pub fn lt(&self) -> Option<FloatPayloadType> {
+        self.0.lt.map(|of| of.into_inner())
+    }
+}
+
+impl PyRangeFloat {
+    fn _getters(self) {
+        // Every field should have a getter method
+        let Range {
+            gte: _,
+            gt: _,
+            lte: _,
+            lt: _,
+        } = self.0;
+    }
 }
 
 #[pyclass(name = "RangeDateTime")]
 #[derive(Copy, Clone, Debug, Into)]
 pub struct PyRangeDateTime(pub Range<DateTimePayloadType>);
 
+#[pyclass_repr]
 #[pymethods]
 impl PyRangeDateTime {
     #[new]
@@ -71,6 +118,38 @@ impl PyRangeDateTime {
             lte: parse_datetime_opt(lte.as_deref())?,
             lt: parse_datetime_opt(lt.as_deref())?,
         }))
+    }
+
+    #[getter]
+    pub fn gte(&self) -> Option<String> {
+        self.0.gte.map(|dt| dt.to_string())
+    }
+
+    #[getter]
+    pub fn gt(&self) -> Option<String> {
+        self.0.gt.map(|dt| dt.to_string())
+    }
+
+    #[getter]
+    pub fn lte(&self) -> Option<String> {
+        self.0.lte.map(|dt| dt.to_string())
+    }
+
+    #[getter]
+    pub fn lt(&self) -> Option<String> {
+        self.0.lt.map(|dt| dt.to_string())
+    }
+}
+
+impl PyRangeDateTime {
+    fn _getters(self) {
+        // Every field should have a getter method
+        let Range {
+            gte: _,
+            gt: _,
+            lte: _,
+            lt: _,
+        } = self.0;
     }
 }
 

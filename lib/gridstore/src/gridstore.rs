@@ -1,29 +1,28 @@
 use std::io::BufReader;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::referenced_counter::HwMetricRefCounter;
+use common::is_alive_lock::IsAliveLock;
 use fs_err as fs;
 use fs_err::File;
 use io::file_operations::atomic_save_json;
 use itertools::Itertools;
 use lz4_flex::compress_prepend_size;
-use memory::mmap_type;
 use parking_lot::RwLock;
 
+use crate::Result;
 use crate::bitmask::Bitmask;
 use crate::blob::Blob;
 use crate::config::{Compression, StorageConfig, StorageOptions};
+use crate::error::GridstoreError;
 use crate::page::Page;
 use crate::tracker::{BlockOffset, PageId, PointOffset, Tracker, ValuePointer};
 
 const CONFIG_FILENAME: &str = "config.json";
 
-pub(crate) type Result<T> = std::result::Result<T, String>;
-
-pub type Flusher = Box<dyn FnOnce() -> std::result::Result<(), mmap_type::Error> + Send>;
+pub type Flusher = Box<dyn FnOnce() -> std::result::Result<(), GridstoreError> + Send>;
 
 /// Storage for values of type `V`.
 ///
@@ -41,12 +40,13 @@ pub struct Gridstore<V> {
     /// Bitmask to represent which "blocks" of data in the pages are used and which are free.
     ///
     /// 0 is free, 1 is used.
-    ///
-    /// Additionally, this is also used as a barrier to wait for a flush to finish when [`wipe`](Self::wipe)'ing.
     bitmask: Arc<RwLock<Bitmask>>,
     /// Path of the directory where the storage files are stored
     base_path: PathBuf,
     _value_type: std::marker::PhantomData<V>,
+
+    /// Lock to prevent concurrent flushes and used for waiting for ongoing flushes to finish.
+    is_alive_flush_lock: IsAliveLock,
 }
 
 #[inline]
@@ -117,8 +117,11 @@ impl<V: Blob> Gridstore<V> {
             Self::open(base_path)
         } else {
             // create folder if it does not exist
-            fs::create_dir_all(&base_path)
-                .map_err(|err| format!("Failed to create gridstore storage directory: {err}"))?;
+            fs::create_dir_all(&base_path).map_err(|err| {
+                GridstoreError::service_error(format!(
+                    "Failed to create gridstore storage directory: {err}"
+                ))
+            })?;
             Self::new(base_path, create_options)
         }
     }
@@ -129,13 +132,15 @@ impl<V: Blob> Gridstore<V> {
     /// It should exist already.
     pub fn new(base_path: PathBuf, options: StorageOptions) -> Result<Self> {
         if !base_path.exists() {
-            return Err("Base path does not exist".to_string());
+            return Err(GridstoreError::service_error("Base path does not exist"));
         }
         if !base_path.is_dir() {
-            return Err("Base path is not a directory".to_string());
+            return Err(GridstoreError::service_error(
+                "Base path is not a directory",
+            ));
         }
 
-        let config = StorageConfig::try_from(options)?;
+        let config = StorageConfig::try_from(options).map_err(GridstoreError::service_error)?;
         let config_path = base_path.join(CONFIG_FILENAME);
 
         let storage = Self {
@@ -145,6 +150,7 @@ impl<V: Blob> Gridstore<V> {
             base_path,
             config,
             _value_type: std::marker::PhantomData,
+            is_alive_flush_lock: IsAliveLock::new(),
         };
 
         // create first page to be covered by the bitmask
@@ -154,7 +160,8 @@ impl<V: Blob> Gridstore<V> {
         storage.pages.write().push(page);
 
         // lastly, write config to disk to use as a signal that the storage has been created correctly
-        atomic_save_json(&config_path, &config).map_err(|err| err.to_string())?;
+        atomic_save_json(&config_path, &config)
+            .map_err(|err| GridstoreError::service_error(err.to_string()))?;
 
         Ok(storage)
     }
@@ -163,17 +170,20 @@ impl<V: Blob> Gridstore<V> {
     /// Returns None if the storage does not exist
     pub fn open(base_path: PathBuf) -> Result<Self> {
         if !base_path.exists() {
-            return Err(format!("Path '{base_path:?}' does not exist"));
+            return Err(GridstoreError::service_error(format!(
+                "Path '{base_path:?}' does not exist"
+            )));
         }
         if !base_path.is_dir() {
-            return Err(format!("Path '{base_path:?}' is not a directory"));
+            return Err(GridstoreError::service_error(format!(
+                "Path '{base_path:?}' is not a directory"
+            )));
         }
 
         // read config file first
         let config_path = base_path.join(CONFIG_FILENAME);
-        let config_file = BufReader::new(File::open(&config_path).map_err(|err| err.to_string())?);
-        let config: StorageConfig =
-            serde_json::from_reader(config_file).map_err(|err| err.to_string())?;
+        let config_file = BufReader::new(File::open(&config_path)?);
+        let config: StorageConfig = serde_json::from_reader(config_file)?;
 
         let page_tracker = Tracker::open(&base_path)?;
 
@@ -188,6 +198,7 @@ impl<V: Blob> Gridstore<V> {
             bitmask: Arc::new(RwLock::new(bitmask)),
             base_path,
             _value_type: std::marker::PhantomData,
+            is_alive_flush_lock: IsAliveLock::new(),
         };
         // load pages
         let mut pages = storage.pages.write();
@@ -201,7 +212,7 @@ impl<V: Blob> Gridstore<V> {
     }
 
     /// Get the path for a given page id
-    pub fn page_path(&self, page_id: u32) -> PathBuf {
+    fn page_path(&self, page_id: u32) -> PathBuf {
         self.base_path.join(format!("page_{page_id}.dat"))
     }
 
@@ -261,7 +272,6 @@ impl<V: Blob> Gridstore<V> {
         } = self.get_pointer(point_offset)?;
 
         let raw = self.read_from_pages::<READ_SEQUENTIAL>(page_id, block_offset, length);
-
         hw_counter.payload_io_read_counter().incr_delta(raw.len());
 
         let decompressed = self.decompress(raw);
@@ -466,15 +476,27 @@ impl<V: Blob> Gridstore<V> {
         let create_options = StorageOptions::from(self.config);
         let base_path = self.base_path.clone();
 
+        // Wait for all background flush operations to finish, abort pending flushes Below we
+        // create a new Gridstore instance with a new flush lock, so flushers created on the new
+        // instance work as expected
+        self.is_alive_flush_lock.blocking_mark_dead();
+
         // Wipe
         self.pages.write().clear();
-        fs::remove_dir_all(&base_path)
-            .map_err(|err| format!("Failed to remove gridstore storage directory: {err}"))?;
+        fs::remove_dir_all(&base_path).map_err(|err| {
+            GridstoreError::service_error(format!(
+                "Failed to remove gridstore storage directory: {err}"
+            ))
+        })?;
 
         // Recreate
-        fs::create_dir_all(&base_path)
-            .map_err(|err| format!("Failed to create gridstore storage directory: {err}"))?;
+        fs::create_dir_all(&base_path).map_err(|err| {
+            GridstoreError::service_error(format!(
+                "Failed to create gridstore storage directory: {err}"
+            ))
+        })?;
         *self = Self::new(base_path, create_options)?;
+
         Ok(())
     }
 
@@ -485,18 +507,23 @@ impl<V: Blob> Gridstore<V> {
     pub fn wipe(self) -> Result<()> {
         let base_path = self.base_path.clone();
 
-        // Barrier to wait for any ongoing flush to finish
-        drop(self.bitmask.write());
+        // Wait for all background flush operations to finish, abort pending flushes
+        self.is_alive_flush_lock.blocking_mark_dead();
 
         // Make sure strong references are dropped, to avoid starting another flush
         drop(self);
 
         // deleted base directory
-        fs::remove_dir_all(base_path)
-            .map_err(|err| format!("Failed to remove gridstore storage directory: {err}"))
+        fs::remove_dir_all(base_path).map_err(|err| {
+            GridstoreError::service_error(format!(
+                "Failed to remove gridstore storage directory: {err}"
+            ))
+        })
     }
 
     /// Iterate over all the values in the storage
+    ///
+    /// Stops when the callback returns Ok(false)
     pub fn iter<F, E>(
         &self,
         mut callback: F,
@@ -536,31 +563,6 @@ impl<V: Blob> Gridstore<V> {
     pub fn get_storage_size_bytes(&self) -> usize {
         self.bitmask.read().get_storage_size_bytes()
     }
-
-    /// Iterate over all the values in the storage, including deleted ones
-    pub fn for_each_unfiltered<F>(&self, mut callback: F) -> Result<()>
-    where
-        F: FnMut(PointOffset, Option<&V>) -> ControlFlow<String, ()>,
-    {
-        for (point_offset, opt_pointer) in self.tracker.read().iter_pointers() {
-            let value = opt_pointer.map(
-                |ValuePointer {
-                     page_id,
-                     block_offset,
-                     length,
-                 }| {
-                    let raw = self.read_from_pages::<true>(page_id, block_offset, length);
-                    let decompressed = self.decompress(raw);
-                    V::from_bytes(&decompressed)
-                },
-            );
-            match callback(point_offset, value.as_ref()) {
-                ControlFlow::Continue(()) => (),
-                ControlFlow::Break(message) => return Err(message),
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<V> Gridstore<V> {
@@ -579,11 +581,17 @@ impl<V> Gridstore<V> {
         let bitmask = Arc::downgrade(&self.bitmask);
         let block_size_bytes = self.config.block_size_bytes;
 
+        let is_alive_flush_lock = self.is_alive_flush_lock.handle();
+
         Box::new(move || {
+            let Some(is_alive_flush_guard) = is_alive_flush_lock.lock_if_alive() else {
+                // Gridstore is cleared, cancel flush
+                return Ok(());
+            };
+
             let (Some(pages), Some(tracker), Some(bitmask)) =
                 (pages.upgrade(), tracker.upgrade(), bitmask.upgrade())
             else {
-                log::debug!("Aborted flushing on a dropped Gridstore instance");
                 return Ok(());
             };
 
@@ -594,7 +602,9 @@ impl<V> Gridstore<V> {
             }
 
             let old_pointers = tracker.write().write_pending_and_flush(pending_updates)?;
-
+            if old_pointers.is_empty() {
+                return Ok(());
+            }
             // Update all free blocks in the bitmask
             bitmask_guard.with_upgraded(|guard| {
                 for (page_id, pointer_group) in
@@ -610,6 +620,9 @@ impl<V> Gridstore<V> {
                 }
             });
             bitmask_guard.flush()?;
+
+            // Keep the guard till the end of the flush to prevent concurrent drop/flushes
+            drop(is_alive_flush_guard);
 
             Ok(())
         })
@@ -638,6 +651,9 @@ impl<V> Gridstore<V> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use fs_err::File;
     use itertools::Itertools;
     use rand::distr::Uniform;
@@ -854,7 +870,7 @@ mod tests {
     #[test]
     fn test_write_across_pages() {
         let page_size = DEFAULT_BLOCK_SIZE_BYTES * DEFAULT_REGION_SIZE_BLOCKS;
-        let (_dir, mut storage) = empty_storage_sized(page_size);
+        let (_dir, mut storage) = empty_storage_sized(page_size, Compression::None);
 
         storage.create_new_page().unwrap();
 
@@ -875,32 +891,50 @@ mod tests {
     }
 
     enum Operation {
+        // Insert point with payload
         Put(PointOffset, Payload),
+        // Delete point by offset
         Delete(PointOffset),
-        Update(PointOffset, Payload),
+        // Get point by offset
         Get(PointOffset),
-        Flush,
+        // Flush after delay
+        FlushDelay(Duration),
+        // Clear storage
+        Clear,
+        // Iter up to limit
+        Iter(PointOffset),
     }
 
     impl Operation {
         fn random(rng: &mut impl Rng, max_point_offset: u32) -> Self {
-            let point_offset = rng.random_range(0..=max_point_offset);
-            let operation = rng.random_range(0..4);
+            let operation = rng.random_range(0..=5);
+            // TODO give different probability to each operation
             match operation {
                 0 => {
                     let size_factor = rng.random_range(1..10);
                     let payload = random_payload(rng, size_factor);
+                    let point_offset = rng.random_range(0..=max_point_offset);
                     Operation::Put(point_offset, payload)
                 }
-                1 => Operation::Delete(point_offset),
-                2 => {
-                    let size_factor = rng.random_range(1..10);
-                    let payload = random_payload(rng, size_factor);
-                    Operation::Update(point_offset, payload)
+                1 => {
+                    let point_offset = rng.random_range(0..=max_point_offset);
+                    Operation::Delete(point_offset)
                 }
-                3 => Operation::Get(point_offset),
-                4 => Operation::Flush,
-                _ => unreachable!(),
+                2 => {
+                    let point_offset = rng.random_range(0..=max_point_offset);
+                    Operation::Get(point_offset)
+                }
+                3 => {
+                    let delay_ms = rng.random_range(0..=500);
+                    let delay = Duration::from_millis(delay_ms);
+                    Operation::FlushDelay(delay)
+                }
+                4 => Operation::Clear,
+                5 => {
+                    let limit = rng.random_range(0..=10);
+                    Operation::Iter(limit)
+                }
+                op => panic!("{op} out of range"),
             }
         }
     }
@@ -908,27 +942,68 @@ mod tests {
     #[rstest]
     fn test_behave_like_hashmap(
         #[values(1_048_576, 2_097_152, DEFAULT_PAGE_SIZE_BYTES)] page_size: usize,
+        #[values(Compression::None, Compression::LZ4)] compression: Compression,
     ) {
         use ahash::AHashMap;
 
-        let (dir, mut storage) = empty_storage_sized(page_size);
+        // Windows struggles with this test on CI so we decrease the workload
+        #[cfg(target_os = "windows")]
+        let operation_count = 1_000;
+        #[cfg(target_os = "windows")]
+        let max_point_offset = 100u32;
+
+        #[cfg(not(target_os = "windows"))]
+        let operation_count = 100_000;
+        #[cfg(not(target_os = "windows"))]
+        let max_point_offset = 10_000u32;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (dir, mut storage) = empty_storage_sized(page_size, compression);
 
         let rng = &mut rand::rngs::SmallRng::from_os_rng();
-        let max_point_offset = 10000u32;
 
         let mut model_hashmap = AHashMap::with_capacity(max_point_offset as usize);
 
-        let operations = (0..100000u32)
-            .map(|_| Operation::random(rng, max_point_offset))
-            .collect::<Vec<_>>();
+        let operations = (0..operation_count).map(|_| Operation::random(rng, max_point_offset));
 
         let hw_counter = HardwareCounterCell::new();
         let hw_counter_ref = hw_counter.ref_payload_io_write_counter();
 
+        // ensure no concurrent flushing & flusher instances
+        let has_flusher_lock = Arc::new(parking_lot::Mutex::new(false));
+
+        let mut flush_thread_handles = Vec::new();
+
         // apply operations to storage and model_hashmap
-        for operation in operations {
+        for (i, operation) in operations.enumerate() {
             match operation {
+                Operation::Clear => {
+                    log::debug!("op:{i} CLEAR");
+                    storage.clear().unwrap();
+                    assert_eq!(storage.max_point_id(), 0, "storage should be empty");
+                    model_hashmap.clear();
+                }
+                Operation::Iter(limit) => {
+                    log::debug!("op:{i} ITER limit:{limit}");
+                    storage
+                        .iter::<_, String>(
+                            |point_offset, payload| {
+                                if point_offset >= limit {
+                                    return Ok(false); // shortcut iteration
+                                }
+                                assert_eq!(
+                                    model_hashmap.get(&point_offset), Some(&payload),
+                                    "storage and model are different when using `iter` for offset:{point_offset}"
+                                );
+                                Ok(true) // no shortcutting
+                            },
+                            hw_counter_ref,
+                        )
+                        .unwrap();
+                }
                 Operation::Put(point_offset, payload) => {
+                    log::debug!("op:{i} PUT offset:{point_offset}");
                     let old1 = storage
                         .put_value(point_offset, &payload, hw_counter_ref)
                         .unwrap();
@@ -940,6 +1015,7 @@ mod tests {
                     );
                 }
                 Operation::Delete(point_offset) => {
+                    log::debug!("op:{i} DELETE offset:{point_offset}");
                     let old1 = storage.delete_value(point_offset);
                     let old2 = model_hashmap.remove(&point_offset);
                     assert_eq!(
@@ -947,13 +1023,8 @@ mod tests {
                         "same deletion failed for point_offset: {point_offset} with {old1:?} vs {old2:?}",
                     );
                 }
-                Operation::Update(point_offset, payload) => {
-                    storage
-                        .put_value(point_offset, &payload, hw_counter_ref)
-                        .unwrap();
-                    model_hashmap.insert(point_offset, payload);
-                }
                 Operation::Get(point_offset) => {
+                    log::debug!("op:{i} GET offset:{point_offset}");
                     let v1_seq = storage.get_value::<true>(point_offset, &hw_counter);
                     let v1_rand = storage.get_value::<false>(point_offset, &hw_counter);
                     let v2 = model_hashmap.get(&point_offset).cloned();
@@ -966,18 +1037,65 @@ mod tests {
                         "get_rand sequential failed for point_offset: {point_offset} with {v1_rand:?} vs {v2:?}",
                     );
                 }
-                Operation::Flush => storage.flusher()().unwrap(),
+                Operation::FlushDelay(delay) => {
+                    let mut flush_lock_guard = has_flusher_lock.lock();
+                    if *flush_lock_guard {
+                        log::debug!(
+                            "op:{i} Skip flushing because a Flusher has already been created"
+                        );
+                    } else {
+                        log::debug!("op:{i} Scheduling flush in {delay:?}");
+                        let flusher = storage.flusher();
+                        *flush_lock_guard = true;
+                        drop(flush_lock_guard);
+                        let flush_lock = has_flusher_lock.clone();
+                        let handle = std::thread::Builder::new()
+                            .name("background_flush".to_string())
+                            .spawn(move || {
+                                thread::sleep(delay); // keep flusher alive while other operation are applied
+                                let mut flush_lock_guard = flush_lock.lock();
+                                assert!(
+                                    *flush_lock_guard,
+                                    "there must be a flusher marked as alive"
+                                );
+                                log::debug!("op:{i} STARTING FLUSH after waiting {delay:?}");
+                                match flusher() {
+                                    Ok(_) => log::debug!("op:{i} FLUSH DONE"),
+                                    Err(err) => log::error!("op:{i} FLUSH failed {err:?}"),
+                                }
+                                *flush_lock_guard = false; // no flusher alive
+                                drop(flush_lock_guard);
+                            })
+                            .unwrap();
+                        flush_thread_handles.push(handle);
+                    }
+                }
             }
         }
 
+        log::debug!("All operations successfully applied - now checking consistency...");
+
+        // wait for all background flushes to complete
+        for handle in flush_thread_handles {
+            handle.join().expect("flush thread should not panic");
+        }
+
         // asset same length
-        assert_eq!(storage.tracker.read().mapping_len(), model_hashmap.len());
+        assert_eq!(
+            storage.tracker.read().mapping_len(),
+            model_hashmap.len(),
+            "different number of points"
+        );
 
         // validate storage and model_hashmap are the same
         for point_offset in 0..=max_point_offset {
             let stored_payload = storage.get_value::<false>(point_offset, &hw_counter);
             let model_payload = model_hashmap.get(&point_offset);
-            assert_eq!(stored_payload.as_ref(), model_payload);
+            assert_eq!(
+                stored_payload.as_ref(),
+                model_payload,
+                "storage and model differ for offset:{point_offset} {stored_payload:?} vs {model_payload:?}"
+            );
         }
 
         // flush data
@@ -1004,6 +1122,15 @@ mod tests {
                 "failed for point_offset: {point_offset}",
             );
         }
+
+        // wipe storage
+        storage.wipe().unwrap();
+
+        // assert base folder is gone
+        assert!(
+            !dir.path().exists(),
+            "base folder should be deleted by wipe"
+        );
     }
 
     #[test]
@@ -1525,5 +1652,78 @@ mod tests {
             1,
             "expect 1 pending update",
         );
+    }
+
+    /// Test that data is only actually flushed when the Gridstore instance is still valid
+    ///
+    /// Specifically:
+    /// - ensure that 'late' flushers don't write any data if already invalidated by a clear or
+    ///   something else
+    #[test]
+    fn test_skip_deferred_flush_after_clear() {
+        let (dir, mut storage) = empty_storage();
+        let path = dir.path().to_path_buf();
+
+        let hw_counter = HardwareCounterCell::new();
+        let hw_counter_ref = hw_counter.ref_payload_io_write_counter();
+        let put_payload =
+            |storage: &mut Gridstore<Payload>, point_offset: u32, payload_value: &str| {
+                let mut payload = Payload::default();
+                payload.0.insert(
+                    "key".to_string(),
+                    serde_json::Value::String(payload_value.to_string()),
+                );
+
+                storage
+                    .put_value(point_offset, &payload, hw_counter_ref)
+                    .unwrap();
+                assert_eq!(storage.pages.read().len(), 1);
+
+                let hw_counter = HardwareCounterCell::new();
+                let stored_payload = storage.get_value::<false>(point_offset, &hw_counter);
+                assert!(stored_payload.is_some());
+                assert_eq!(stored_payload.unwrap(), payload);
+            };
+
+        // Write enough new pointers so that they don't fit in the default tracker file size
+        // On flush, the tracker file will be resized and reopened, significant for this test
+        let file_size = storage.tracker.read().mmap_file_size();
+        const POINTER_SIZE: usize = size_of::<Option<ValuePointer>>();
+        let last_point_offset = (file_size / POINTER_SIZE) as u32;
+        for i in 0..=last_point_offset {
+            put_payload(&mut storage, i, "value x");
+        }
+
+        let flusher = storage.flusher();
+
+        // Clone arcs to keep storage alive after clear
+        // Necessary for this test to allow the flusher task to still upgrade its weak arcs when we
+        // call the flusher. This allows us to trigger broken flush behavior in old versions.
+        // The same is possible without cloning these arcs, but it would require specific timing
+        // conditions. Cloning arcs here is much more reliable for this test case.
+        let storage_arcs = (
+            Arc::clone(&storage.pages),
+            Arc::clone(&storage.tracker),
+            Arc::clone(&storage.bitmask),
+        );
+
+        // We clear the storage, pending flusher must not write anything anymore
+        storage.clear().unwrap();
+
+        // Flusher is invalidated and does nothing
+        // This was broken before <https://github.com/qdrant/qdrant/pull/7702>
+        flusher().unwrap();
+
+        drop(storage_arcs);
+
+        // We expect the storage to be empty
+        assert!(storage.get_pointer(0).is_none(), "point must not exist");
+
+        // If we reopen the storage it must still be empty
+        drop(storage);
+        let storage = Gridstore::<Payload>::open(path.clone()).unwrap();
+        assert_eq!(storage.pages.read().len(), 1);
+        assert!(storage.get_pointer(0).is_none(), "point must not exist");
+        assert_eq!(storage.max_point_id(), 0, "must have zero points");
     }
 }

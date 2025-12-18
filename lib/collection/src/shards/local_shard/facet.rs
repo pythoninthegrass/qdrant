@@ -24,11 +24,9 @@ impl LocalShard {
         &self,
         request: Arc<FacetParams>,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<FacetValueHit>> {
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
-
         let stopping_guard = StoppingGuard::new();
 
         let spawn_read = |segment: LockedSegment, hw_counter: &HardwareCounterCell| {
@@ -60,7 +58,7 @@ impl LocalShard {
             )
         }
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         let merged_hits = process_results(all_reads, |reads| {
             reads.reduce(|mut acc, map| {
@@ -93,16 +91,13 @@ impl LocalShard {
         &self,
         request: Arc<FacetParams>,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<FacetValueHit>> {
         // To return exact counts we need to consider that the same point can be in different segments if it has different versions.
         // So, we need to consider all point ids for a given filter in all segments to do an accurate count.
         //
         // To do this we will perform exact counts for each of the values in the field.
-
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
-
         let instant = std::time::Instant::now();
 
         // Get unique values for the field
@@ -139,7 +134,7 @@ impl LocalShard {
             future::try_join_all(hits_futures),
         )
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         Ok(hits)
     }
@@ -188,7 +183,7 @@ impl LocalShard {
             )
         }
         .await
-        .map_err(|_: Elapsed| CollectionError::timeout(timeout.as_secs() as usize, "facet"))??;
+        .map_err(|_: Elapsed| CollectionError::timeout(timeout, "facet"))??;
 
         let all_values =
             process_results(all_reads, |reads| reads.flatten().collect::<BTreeSet<_>>())?;

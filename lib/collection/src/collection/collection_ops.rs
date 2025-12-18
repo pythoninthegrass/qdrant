@@ -1,4 +1,4 @@
-use std::cmp;
+use std::cmp::{self, Reverse};
 use std::sync::Arc;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -8,18 +8,23 @@ use segment::types::{Payload, QuantizationConfig, StrictModeConfig};
 use semver::Version;
 
 use super::Collection;
+use crate::collection_manager::optimizers::IndexingProgressViews;
 use crate::operations::config_diff::*;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 use crate::optimizers_builder::OptimizersConfig;
-use crate::shards::replica_set::{Change, ReplicaState};
+use crate::shards::replica_set::Change;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::PeerId;
 
 lazy_static! {
-    /// When dropping a shard, only cancel all related shard transfers to and from it when all nodes
-    /// are running at least this version. That way, we avoid getting an inconsistent state in
-    /// consensus if some nodes are still running an older version.
-    static ref ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION: Version = Version::parse("1.9.0-dev").unwrap();
+    /// Old logic for aborting shard transfers on shard drop, had a bug: it dropped all transfers
+    /// regardless of the shard id. In order to keep consensus consistent, we can only
+    /// enable new fixed logic once cluster fully switched to this version.
+    /// Otherwise, some node might follow old logic and some - new logic.
+    ///
+    /// See: <https://github.com/qdrant/qdrant/pull/7792>
+    pub(super) static ref ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION: Version = Version::parse("1.16.3-dev").unwrap();
 }
 
 impl Collection {
@@ -245,19 +250,24 @@ impl Collection {
                 });
             }
 
-            let all_nodes_cancel_transfers = self
+            let all_nodes_fixed_cancellation = self
                 .channel_service
-                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION);
-            if all_nodes_cancel_transfers {
-                // Collect shard transfers related to removed shard...
-                let transfers = shard_holder
-                    .get_transfers(|transfer| transfer.from == peer_id || transfer.to == peer_id);
+                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FIX_FROM_VERSION);
 
-                // ...and cancel transfer tasks and remove transfers from internal state
-                for transfer in transfers {
-                    self.abort_shard_transfer_and_resharding(transfer.key(), Some(&shard_holder))
-                        .await?;
-                }
+            // Collect shard transfers related to removed shard...
+            let transfers = if all_nodes_fixed_cancellation {
+                shard_holder.get_related_transfers(peer_id, shard_id)
+            } else {
+                // This is the old buggy logic, but we have to keep it
+                // for maintaining consistency in a cluster with mixed versions.
+                shard_holder
+                    .get_transfers(|transfer| transfer.from == peer_id || transfer.to == peer_id)
+            };
+
+            // ...and cancel transfer tasks and remove transfers from internal state
+            for transfer in transfers {
+                self.abort_shard_transfer_and_resharding(transfer.key(), Some(&shard_holder))
+                    .await?;
             }
 
             replica_set.remove_peer(peer_id).await?;
@@ -412,6 +422,39 @@ impl Collection {
             resharding_operations,
         };
         Ok(info)
+    }
+
+    pub async fn optimizations(
+        &self,
+        completed_limit: Option<usize>,
+    ) -> CollectionResult<OptimizationsResponse> {
+        let mut all_ongoing = Vec::new();
+        let mut all_completed = completed_limit.map(|_| Vec::new());
+
+        let shards_holder = self.shards_holder.read().await;
+        for (_shard_id, replica_set) in shards_holder.get_shards() {
+            let Some(log) = replica_set.optimizers_log().await else {
+                continue;
+            };
+            let IndexingProgressViews { ongoing, completed } = log.lock().progress_views();
+            all_ongoing.extend(ongoing);
+            if let Some(all_completed) = all_completed.as_mut() {
+                all_completed.extend(completed);
+            }
+        }
+        // Sort - see `OptimizationsResponse` doc
+        all_ongoing.sort_by_key(|v| Reverse(v.started_at()));
+        if let Some(all_completed) = all_completed.as_mut() {
+            all_completed.sort_by_key(|v| Reverse(v.started_at()));
+            // Unwrap is ok because `all_completed` and `completed_limit`
+            // either are both `Some` or both `None`.
+            all_completed.truncate(completed_limit.unwrap());
+        }
+        let root = "Segment Optimizing";
+        Ok(OptimizationsResponse {
+            ongoing: all_ongoing.into_iter().map(|v| v.snapshot(root)).collect(),
+            completed: all_completed.map(|c| c.into_iter().map(|v| v.snapshot(root)).collect()),
+        })
     }
 
     pub async fn print_warnings(&self) {

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
 use api::rest::models::HardwareUsage;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use itertools::Itertools;
 use prometheus::TextEncoder;
 use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use segment::common::operation_time_statistics::OperationDurationStatistics;
+use shard::PeerId;
+use storage::types::ConsensusThreadStatus;
 
 use super::telemetry_ops::hardware::HardwareTelemetry;
 use crate::common::telemetry::TelemetryData;
@@ -127,7 +129,10 @@ trait MetricsProvider {
 impl MetricsProvider for TelemetryData {
     fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
         self.app.add_metrics(metrics, prefix);
-        self.collections.add_metrics(metrics, prefix);
+
+        let this_peer_id = self.cluster.as_ref().and_then(|i| i.this_peer_id());
+        self.collections.add_metrics(metrics, prefix, this_peer_id);
+
         if let Some(cluster) = &self.cluster {
             cluster.add_metrics(metrics, prefix);
         }
@@ -179,8 +184,13 @@ impl MetricsProvider for AppFeaturesTelemetry {
     }
 }
 
-impl MetricsProvider for CollectionsTelemetry {
-    fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
+impl CollectionsTelemetry {
+    fn add_metrics(
+        &self,
+        metrics: &mut MetricsData,
+        prefix: Option<&str>,
+        peer_id: Option<PeerId>,
+    ) {
         metrics.push_metric(metric_family(
             "collections_total",
             "number of collections",
@@ -212,6 +222,10 @@ impl MetricsProvider for CollectionsTelemetry {
         let mut snapshots_created_total = Vec::with_capacity(num_collections);
 
         let mut vector_count_by_name = Vec::with_capacity(num_collections);
+
+        // Shard transfers
+        let mut shard_transfers_in = Vec::with_capacity(num_collections);
+        let mut shard_transfers_out = Vec::with_capacity(num_collections);
 
         for collection in self.collections.iter().flatten() {
             let collection = match collection {
@@ -322,6 +336,31 @@ impl MetricsProvider for CollectionsTelemetry {
                 .flatten()
                 .filter(|i| i.replicate_states.values().any(|state| !state.is_active()))
                 .count();
+
+            // Shard Transfers
+
+            let mut incoming_transfers = 0;
+            let mut outgoing_transfers = 0;
+
+            if let Some(this_peer_id) = peer_id {
+                for transfer in collection.transfers.iter().flatten() {
+                    if transfer.to == this_peer_id {
+                        incoming_transfers += 1;
+                    }
+                    if transfer.from == this_peer_id {
+                        outgoing_transfers += 1;
+                    }
+                }
+            }
+
+            shard_transfers_in.push(gauge(
+                f64::from(incoming_transfers),
+                &[("id", &collection.id)],
+            ));
+            shard_transfers_out.push(gauge(
+                f64::from(outgoing_transfers),
+                &[("id", &collection.id)],
+            ));
         }
 
         for snapshot_telemetry in self.snapshots.iter().flatten() {
@@ -447,6 +486,22 @@ impl MetricsProvider for CollectionsTelemetry {
             snapshots_created_total,
             prefix,
         ));
+
+        metrics.push_metric(metric_family(
+            "collection_shard_transfer_incoming",
+            "incoming shard transfers currently running",
+            MetricType::GAUGE,
+            shard_transfers_in,
+            prefix,
+        ));
+
+        metrics.push_metric(metric_family(
+            "collection_shard_transfer_outgoing",
+            "outgoing shard transfers currently running",
+            MetricType::GAUGE,
+            shard_transfers_out,
+            prefix,
+        ));
     }
 }
 
@@ -515,6 +570,42 @@ impl MetricsProvider for ClusterStatusTelemetry {
                 prefix,
             ));
         }
+
+        // Initialize all states so that every state has a zeroed metric by default.
+        let mut state_working = 0.0;
+        let mut state_stopped = 0.0;
+
+        match &self.consensus_thread_status {
+            ConsensusThreadStatus::Working { last_update } => {
+                let timestamp = last_update.timestamp();
+
+                metrics.push_metric(metric_family(
+                    "cluster_last_update_timestamp_seconds",
+                    "unix timestamp of last update",
+                    MetricType::COUNTER,
+                    vec![counter(timestamp as f64, &[])],
+                    prefix,
+                ));
+
+                state_working = 1.0;
+            }
+            ConsensusThreadStatus::Stopped | ConsensusThreadStatus::StoppedWithErr { err: _ } => {
+                state_stopped = 1.0;
+            }
+        }
+
+        let working_states = vec![
+            gauge(state_working, &[("state", "working")]),
+            gauge(state_stopped, &[("state", "stopped")]),
+        ];
+
+        metrics.push_metric(metric_family(
+            "cluster_working_state",
+            "working state of the cluster",
+            MetricType::GAUGE,
+            working_states,
+            prefix,
+        ));
     }
 }
 

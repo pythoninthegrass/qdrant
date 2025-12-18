@@ -25,6 +25,7 @@ use crate::common::telemetry_ops::requests_telemetry::{
 };
 use crate::settings::Settings;
 
+// Keep in sync with openapi/openapi-service.ytt.yaml
 const DEFAULT_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct TelemetryCollector {
@@ -113,9 +114,7 @@ impl TelemetryCollector {
 
         let collections_telemetry = tokio::time::timeout(timeout, collections_telemetry_handle)
             .await
-            .map_err(|_: Elapsed| {
-                StorageError::timeout(timeout.as_secs() as usize, "collections telemetry")
-            })???;
+            .map_err(|_: Elapsed| StorageError::timeout(timeout, "collections telemetry"))???;
 
         Ok(TelemetryData {
             id: self.process_id.to_string(),

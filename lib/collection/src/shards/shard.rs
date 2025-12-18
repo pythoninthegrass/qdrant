@@ -1,17 +1,20 @@
 use core::marker::{Send, Sync};
 use std::future::{self, Future};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
 use common::types::TelemetryDetail;
+use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::manifest::SnapshotManifest;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{Filter, SizeStats, SnapshotFormat};
 
 use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
 use crate::operations::operation_effect::{EstimateOperationEffectArea, OperationEffectArea};
 use crate::operations::types::{CollectionError, CollectionResult, OptimizersStatus};
 use crate::shards::dummy_shard::DummyShard;
@@ -35,7 +38,7 @@ pub type ShardReplicasPlacement = Vec<PeerId>;
 /// Example: [
 ///     [1, 2],
 ///     [2, 3],
-///     [3, 4]
+///     [3, 4],
 /// ] - 3 shards, each has 2 replicas
 pub type ShardsPlacement = Vec<ShardReplicasPlacement>;
 
@@ -113,13 +116,13 @@ impl Shard {
         }
     }
 
-    pub async fn get_size_stats(&self) -> SizeStats {
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
         match self {
-            Shard::Local(local_shard) => local_shard.get_size_stats().await,
-            Shard::Proxy(proxy_shard) => proxy_shard.get_size_stats().await,
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_size_stats().await,
-            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_size_stats().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.get_size_stats(),
+            Shard::Local(local_shard) => local_shard.get_size_stats(timeout).await,
+            Shard::Proxy(proxy_shard) => proxy_shard.get_size_stats(timeout).await,
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_size_stats(timeout).await,
+            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_size_stats(timeout).await,
+            Shard::Dummy(dummy_shard) => Ok(dummy_shard.get_size_stats()),
         }
     }
 
@@ -233,6 +236,18 @@ impl Shard {
         Some(update_tracker)
     }
 
+    pub fn optimizers_log(&self) -> Option<Arc<ParkingMutex<TrackerLog>>> {
+        let optimizers_log = match self {
+            Self::Local(local_shard) => local_shard.optimizers_log(),
+            Self::Proxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::ForwardProxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::QueueProxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::Dummy(_) => return None,
+        };
+
+        Some(optimizers_log)
+    }
+
     pub async fn shard_recovery_point(&self) -> CollectionResult<RecoveryPoint> {
         match self {
             Self::Local(local_shard) => Ok(local_shard.recovery_point().await),
@@ -244,6 +259,44 @@ impl Shard {
                     self.variant_name(),
                 )))
             }
+        }
+    }
+
+    pub async fn take_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        match self {
+            Self::Local(local_shard) => local_shard.take_newest_clocks_snapshot().await,
+            Self::Proxy(ProxyShard { wrapped_shard, .. })
+            | Self::ForwardProxy(ForwardProxyShard { wrapped_shard, .. }) => {
+                wrapped_shard.take_newest_clocks_snapshot().await
+            }
+            Self::QueueProxy(proxy) => {
+                if let Some(local_shard) = proxy.wrapped_shard() {
+                    local_shard.take_newest_clocks_snapshot().await
+                } else {
+                    Ok(())
+                }
+            }
+            // Ignore dummy shard, it is not loaded
+            Self::Dummy(_) => Ok(()),
+        }
+    }
+
+    pub async fn clear_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        match self {
+            Self::Local(local_shard) => local_shard.clear_newest_clocks_snapshot().await,
+            Self::Proxy(ProxyShard { wrapped_shard, .. })
+            | Self::ForwardProxy(ForwardProxyShard { wrapped_shard, .. }) => {
+                wrapped_shard.clear_newest_clocks_snapshot().await
+            }
+            Self::QueueProxy(proxy) => {
+                if let Some(local_shard) = proxy.wrapped_shard() {
+                    local_shard.clear_newest_clocks_snapshot().await
+                } else {
+                    Ok(())
+                }
+            }
+            // Ignore dummy shard, it is not loaded
+            Self::Dummy(_) => Ok(()),
         }
     }
 

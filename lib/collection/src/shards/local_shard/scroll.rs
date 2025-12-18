@@ -42,7 +42,7 @@ impl LocalShard {
             self.query_scroll(
                 request,
                 search_runtime_handle,
-                Some(timeout),
+                timeout,
                 hw_measurement_acc.clone(),
             )
         });
@@ -52,11 +52,8 @@ impl LocalShard {
         tokio::time::timeout(timeout, all_scroll_results)
             .await
             .map_err(|_| {
-                log::debug!(
-                    "Query scroll timeout reached: {} seconds",
-                    timeout.as_secs()
-                );
-                CollectionError::timeout(timeout.as_secs() as usize, "Query scroll")
+                log::debug!("Query scroll timeout reached: {timeout:?}");
+                CollectionError::timeout(timeout, "Query scroll")
             })?
     }
 
@@ -65,7 +62,7 @@ impl LocalShard {
         &self,
         request: &QueryScrollRequestInternal,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let QueryScrollRequestInternal {
@@ -146,11 +143,10 @@ impl LocalShard {
         with_vector: &WithVector,
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
         let stopping_guard = StoppingGuard::new();
         let segments = self.segments.clone();
 
@@ -183,7 +179,7 @@ impl LocalShard {
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "scroll_by_id"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "scroll_by_id"))??;
 
         let point_ids = all_reads
             .into_iter()
@@ -204,11 +200,12 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                timeout,
                 hw_measurement_acc,
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "retrieve"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "retrieve"))??;
 
         drop(update_operation_lock);
 
@@ -230,11 +227,10 @@ impl LocalShard {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         order_by: &OrderBy,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
         let stopping_guard = StoppingGuard::new();
         let segments = self.segments.clone();
 
@@ -271,7 +267,7 @@ impl LocalShard {
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "scroll_by_field"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "scroll_by_field"))??;
 
         let all_reads = all_reads.into_iter().collect::<Result<Vec<_>, _>>()?;
 
@@ -299,11 +295,12 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                timeout,
                 hw_measurement_acc,
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "retrieve"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "retrieve"))??;
 
         drop(update_operation_lock);
 
@@ -328,11 +325,10 @@ impl LocalShard {
         with_vector: &WithVector,
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        timeout: Duration,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
         let stopping_guard = StoppingGuard::new();
         let segments = self.segments.clone();
 
@@ -373,7 +369,7 @@ impl LocalShard {
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "scroll_randomly"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "scroll_randomly"))??;
 
         let (availability, mut segments_reads): (Vec<_>, Vec<_>) = all_reads.into_iter().unzip();
 
@@ -438,11 +434,12 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                timeout,
                 hw_measurement_acc,
             ),
         )
         .await
-        .map_err(|_| CollectionError::timeout(timeout.as_secs() as usize, "retrieve"))??;
+        .map_err(|_| CollectionError::timeout(timeout, "retrieve"))??;
 
         drop(update_operation_lock);
 

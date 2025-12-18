@@ -83,7 +83,7 @@ fn check_query_vector(
                 check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::FeedbackSimple(feedback_query) => {
+        QueryVector::FeedbackNaive(feedback_query) => {
             feedback_query.flat_iter().try_for_each(|vector| {
                 check_vector_against_config(VectorRef::from(vector), vector_config)
             })?
@@ -117,7 +117,7 @@ fn check_query_sparse_vector(
                 check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
         }
-        QueryVector::FeedbackSimple(feedback_query) => {
+        QueryVector::FeedbackNaive(feedback_query) => {
             feedback_query.flat_iter().try_for_each(|vector| {
                 check_sparse_vector_against_config(VectorRef::from(vector), vector_config)
             })?
@@ -245,3 +245,4 @@ pub fn check_stopped(is_stopped: &AtomicBool) -> OperationResult<()> {
 }
 
 pub const BYTES_IN_KB: usize = 1024;
+pub const BYTES_IN_MB: usize = 1_048_576;

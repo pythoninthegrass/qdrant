@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [features]
-bench_rocksdb = ["dep:rocksdb"]
+rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -23,6 +23,7 @@ serde = { workspace = true }
 smallvec = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 lz4_flex = { version = "0.12.0", default-features = false }
 log = { workspace = true }
 rand = { workspace = true }
@@ -45,6 +46,7 @@ rstest = { workspace = true }
 proptest = { workspace = true }
 bustle = "0.5.1"
 common = { path = "../common/common", features = ["testing"] }
+env_logger = "0.11"
 
 [[bench]]
 name = "random_data_bench"

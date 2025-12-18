@@ -28,8 +28,8 @@ env_logger = "0.11"
 fs-err = { workspace = true, features = ["debug"] }
 humantime = { workspace = true }
 indicatif = { workspace = true }
-ndarray = "0.16.1"
-ndarray-npy = { version = "0.9.1", default-features = false }
+ndarray = "0.17.1"
+ndarray-npy = { version = "0.10.0", default-features = false }
 rmp-serde = "~1.3"
 rand_distr = { workspace = true }
 walkdir = { workspace = true }
@@ -71,7 +71,7 @@ atomicwrites = { workspace = true }
 memmap2 = { workspace = true }
 schemars = { workspace = true }
 log = { workspace = true }
-geo = "0.31.0"
+geo = "0.32.0"
 geohash = "0.13.1"
 num-traits = { workspace = true }
 num-derive = "0.4.2"
@@ -89,7 +89,7 @@ ecow = { workspace = true }
 fnv = { workspace = true }
 indexmap = { workspace = true }
 ahash = { workspace = true }
-self_cell = "1.2.0"
+self_cell = "1.2.1"
 sha2 = { workspace = true }
 smallvec = { workspace = true }
 is_sorted = "0.1.1"

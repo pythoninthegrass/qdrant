@@ -25,6 +25,7 @@ use super::remote_shard::RemoteShard;
 use super::transfer::driver::MAX_RETRY_COUNT;
 use super::transfer::transfer_tasks_pool::TransferTaskProgress;
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
 use crate::operations::OperationWithClockTag;
 use crate::operations::point_ops::WriteOrdering;
 use crate::operations::types::{
@@ -125,6 +126,11 @@ impl QueueProxyShard {
         })
     }
 
+    /// Get the wrapped local shard
+    pub(super) fn wrapped_shard(&self) -> Option<&LocalShard> {
+        self.inner.as_ref().map(|inner| &inner.wrapped_shard)
+    }
+
     /// Get inner queue proxy shard. Will panic if the queue proxy has been finalized.
     fn inner_unchecked(&self) -> &Inner {
         self.inner.as_ref().expect("Queue proxy has been finalized")
@@ -209,12 +215,19 @@ impl QueueProxyShard {
             .await
     }
 
-    pub async fn get_size_stats(&self) -> SizeStats {
-        self.inner_unchecked().wrapped_shard.get_size_stats().await
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
+        self.inner_unchecked()
+            .wrapped_shard
+            .get_size_stats(timeout)
+            .await
     }
 
     pub fn update_tracker(&self) -> &UpdateTracker {
         self.inner_unchecked().wrapped_shard.update_tracker()
+    }
+
+    pub fn optimizers_log(&self) -> Arc<ParkingMutex<TrackerLog>> {
+        self.inner_unchecked().wrapped_shard.optimizers_log()
     }
 
     /// Check if the queue proxy shard is already finalized

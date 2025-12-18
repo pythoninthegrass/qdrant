@@ -13,13 +13,6 @@ let
   sources = import ./tools/nix/npins;
   fenix = import sources.fenix { inherit pkgs; };
   pkgs = import sources.nixpkgs { };
-  poetry2nix = import sources.poetry2nix { inherit pkgs; };
-
-  # Python dependencies used in tests
-  python-env = poetry2nix.mkPoetryEnv {
-    projectDir = ./tests; # reads pyproject.toml and poetry.lock
-    preferWheels = true; # wheels speed up building of the environment
-  };
 
   # Use mold linker to speed up builds
   mkShell =
@@ -51,14 +44,18 @@ mkShell {
     pkgs.maturin # mentioned in lib/edge/python/README.md
     pkgs.nixfmt-rfc-style # to format this file
     pkgs.npins # used in tools/nix/update.py
-    pkgs.poetry # used to update poetry.lock
+    pkgs.python3 # used in ./tests, ./tools, lib/edge
     pkgs.sccache # mentioned in shellHook
+    pkgs.uv # used in tests
     pkgs.vulkan-tools # mentioned in .github/workflows/rust-gpu.yml
     pkgs.wget # used in tests/storage-compat
     pkgs.yq-go # used in tools/generate_openapi_models.sh
     pkgs.ytt # used in tools/generate_openapi_models.sh
-    python-env # used in tests
   ];
+
+  # Fix for tikv-jemalloc-sys
+  # https://github.com/tikv/jemallocator/issues/108
+  hardeningDisable = [ "fortify" ];
 
   shellHook = ''
     # Caching for C/C++ deps, particularly for librocksdb-sys
@@ -72,10 +69,6 @@ mkShell {
     # Caching for lindera-unidic
     [ "''${LINDERA_CACHE+x}" ] ||
       export LINDERA_CACHE="''${XDG_CACHE_HOME:-$HOME/.cache}/lindera"
-
-    # Fix for tikv-jemalloc-sys
-    # https://github.com/NixOS/nixpkgs/issues/370494#issuecomment-2625163369
-    export CFLAGS=-DJEMALLOC_STRERROR_R_RETURNS_CHAR_WITH_GNU_SOURCE
 
     # Fix for older macOS
     # https://github.com/rust-rocksdb/rust-rocksdb/issues/776

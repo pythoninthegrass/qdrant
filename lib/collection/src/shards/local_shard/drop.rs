@@ -14,6 +14,12 @@ impl Drop for LocalShard {
             self.shard_path().display()
         );
 
+        // Uncomment to investigate shard drop without graceful shutdown
+        // #[cfg(feature = "staging")]
+        // {
+        //     log::debug!("{}", std::backtrace::Backtrace::force_capture());
+        // }
+
         // Normally we expect, that LocalShard should be explicitly stopped in asynchronous
         // runtime before being dropped.
         // We want this because:
@@ -41,6 +47,7 @@ impl Drop for LocalShard {
                         return true;
                     }
                     update_handler.stop_flush_worker();
+                    update_handler.notify_optimization_handles_to_stop();
                 }
 
                 // This can block longer, if the channel is full

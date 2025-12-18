@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::mem;
+use std::{fmt, mem};
 
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc as _};
 use derive_more::Into;
@@ -7,6 +7,8 @@ use pyo3::IntoPyObjectExt as _;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
+
+use crate::repr::*;
 
 #[derive(Clone, Debug, Into, TransparentWrapper)]
 #[repr(transparent)]
@@ -99,6 +101,12 @@ impl<'py> IntoPyObject<'py> for &PyValue {
     }
 }
 
+impl Repr for PyValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 pub type ValueMap = serde_json::Map<String, serde_json::Value>;
 
 pub fn value_map_from_py(dict: &Bound<'_, PyAny>) -> PyResult<ValueMap> {
@@ -120,7 +128,7 @@ pub fn value_map_into_py<'py>(map: &ValueMap, py: Python<'py>) -> PyResult<Bound
 
     for (key, value) in map {
         let key = PyString::new(py, key);
-        let value = PyValue::wrap_ref(value).into_bound_py_any(py)?;
+        let value = PyValue::wrap_ref(value).into_pyobject(py)?;
         dict.set_item(key, value)?;
     }
 
